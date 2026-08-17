@@ -1,0 +1,481 @@
+#!/usr/bin/env python
+
+'''
+This program takes an arbitrary binary IQ signal or Matlab 5.0 file as input
+and analyses it using the techniques present in Chad Spooner's CSP blog at
+https://cyclostationary.blog .  Not additional mathematics is performed that
+is not shown there.  However, the program groups the plots together, and
+uses canned text to create a report.  The report is not complete and is
+simply raw CSP data.  The person analyzing the signal must augment the
+report with interpretation and description of what each of the major cycles
+are.
+
+Please excuse the poor commenting.  I hope to correct that!  Till then, start
+with main() at the bottom of this file.
+
+Mike Markowski
+mike.ab3ap@gmail.com
+Dec 2021 original
+Jun 2026
+'''
+
+import cspPlot
+import libcsp as csp
+import matlab5 as ml
+import numpy as np
+import os
+import scipy.io as sio
+import sys
+import tex
+import time
+import util
+
+def analyze(config, maxBlind=500, maxScf=10):
+
+    # Retrieve configuration from dictionary.
+    fc_Hz = config['fc_Hz']
+    fs_Hz = config['fs_Hz']
+    blindType = config['blind']
+    scfType = config['scf']
+    sigFile = config['sig']
+    threshSc = config['thresh']
+    w = config['win']
+
+    fs0_Hz, fc0_Hz, bw_Hz, iq = readSig(sigFile)
+    if config['fc_Hz'] is None: # Happens for .iq file and no -c option.
+        fc_Hz = config['fc_Hz'] = fc0_Hz
+    if config['fs_Hz'] is None: # Happens for .iq file and no -s option.
+        fs_Hz = config['fs_Hz'] = fs0_Hz
+
+    if config['fc_Hz'] is None: # Happens for .iq file and no -c option.
+        print('analyze: fc_Hz of input signal not specified.  Using 0 Hz.')
+        fc_Hz = config['fc_Hz'] = 0
+    if config['fs_Hz'] is None: # Happens for .iq file and no -r option.
+        print('analyze: fs_Hz of sample rate not specified.  Using 1 Hz.')
+        fs_Hz = config['fs_Hz'] = 1
+
+    # Blind detection quads are: [f, alpha, scf, sc].
+    t0 = time.process_time()
+    quadsN, quadsC = blind(blindType, threshSc, iq, maxBlind)
+    t1 = time.process_time()
+    print('%8.1f ms: Blind analysis' % ((t1-t0)*1e3))
+    alphasN = quadsN[:, 1] # Cycle frequencies.
+    alphasC = quadsC[:, 1]
+    scN = quadsN[:, 2]     # [:,3] coherences, [:,2] SCFs.
+    scC = quadsC[:, 2]
+
+    nSa = iq.size
+    g = 20 if blindType=='fam' else 5 # Loosen for FAM grid.
+    t0 = time.process_time()
+    alphasN, scN = csp.binAlpha(
+        fs_Hz, nSa, alphasN, scN, maxScf, conj=False, guard=g)
+    alphasC, scC = csp.binAlpha(
+        fs_Hz, nSa, alphasC, scC, maxScf, conj=True, guard=g)
+    t1 = time.process_time()
+    print('%8.1f ms: Binning' % ((t1-t0)*1e3))
+
+    # Snap blind-detected alphas onto cyper()'s matched-shift grid.  Semi
+    # cheap here since binAlpha() has already trimmed candidates way down.
+    t0 = time.process_time()
+    alphasN = csp.alphaRefine(iq, alphasN, conj=False, radius=8)
+    alphasC = csp.alphaRefine(iq, alphasC, conj=True, radius=8)
+    t1 = time.process_time()
+    print('%8.1f ms: Refining bins' % ((t1-t0)*1e3))
+
+    # Calculate spectral coherences for highest blind SCFs.
+    t0 = time.process_time()
+    scC = []
+    scN = []
+    for a in alphasC:
+        scC.append(csp.sc(iq, a, conj=True))
+    for a in alphasN:
+        scN.append(csp.sc(iq, a))
+    scC = np.array(scC)
+    scN = np.array(scN)
+    t1 = time.process_time()
+    print('%8.1f ms: Spectral coherences' % ((t1-t0)*1e3))
+
+    # Study best cycle frequencies. TSM used when scfType=='tsm'.
+    t0 = time.process_time()
+    scfN, w = scf(scfType, iq, alphasN, conj=False, fs_Hz=fs_Hz, win=w)
+    scfC, w = scf(scfType, iq, alphasC, conj=True,  fs_Hz=fs_Hz, win=w)
+    t1 = time.process_time()
+    print('%8.1f ms: Spectral correlation functions' % ((t1-t0)*1e3))
+
+    # Looser re-bin for later plotting.
+    t0 = time.process_time()
+    s = []
+    for i in range(alphasN.size):
+        s.append(max(np.abs(scN[i]))) # Max SCF value.
+    s = np.array(s)
+    ind = csp.binArrays(alphasN, s, 4/nSa)
+    alphasN = alphasN[ind]
+    s = s[ind]
+    scfN = scfN[ind]
+    scN = scN[ind]
+
+    s = []
+    for i in range(alphasC.size):
+        s.append(max(np.abs(scC[i]))) # Max SCF value.
+    s = np.array(s)
+    ind = csp.binArrays(alphasC, s, 4/nSa)
+    alphasC = alphasC[ind]
+    s = s[ind]
+    scfC = scfC[ind]
+    scC = scC[ind]
+
+    s = []
+    for i in range(alphasC.size):
+        s.append(max(np.abs(scC[i]))) # Max SCF value.
+    s = np.array(s)
+    ind = np.argsort(s)[::-1] # Sort by descending SCF.
+    scfC = scfC[ind]
+    scC = scC[ind]
+    alphasC = alphasC[ind]
+    alphasC = alphasC[:maxScf]
+    scfC = scfC[:maxScf]
+    scC = scC[:maxScf]
+
+    s = []
+    for i in range(alphasN.size):
+        s.append(max(np.abs(scN[i]))) # Max SCF value.
+    s = np.array(s)
+    ind = np.argsort(s)[::-1] # Sort by descending SCF.
+    scfN = scfN[ind]
+    scN = scN[ind]
+    alphasN = alphasN[ind]
+    alphasN = alphasN[:maxScf]
+    scfN = scfN[:maxScf]
+    scN = scN[:maxScf]
+    t1 = time.process_time()
+    print('%8.1f ms: Loose binning for plots' % ((t1-t0)*1e3))
+
+    results = {} # Dictionary of results.
+    results['alphaC'] = alphasC # Top conjugate cycle freqs.
+    results['alphaN'] = alphasN # Top non-conj cycle freqs.
+    results['bw_Hz'] = bw_Hz # Signal bandwidth retrieved from signal file.
+    results['fc_Hz'] = fc_Hz # Center frequency retrieved from signal file.
+    results['fs_Hz'] = fs_Hz # Sample rate retrieved from signal file.
+    results['maxBlind'] = maxBlind
+    results['maxScf'] = maxScf
+    results['quadsC'] = quadsC # Conjugate blind results, all.
+    results['quadsN'] = quadsN # Non-conjugate blind detection, all.
+    results['scC'] = scC # Top conjugate spectral coherences.
+    results['scN'] = scN # Top non-conjugate spectral coherences.
+    results['scfC'] = scfC # Top conjugate spectral correlation function.
+    results['scfN'] = scfN # Top non-conjugate spectral correlation function.
+    results['win'] = w
+    return results, iq
+
+def blind(blindType, thresh, sig, nMax=500, sortby='sc'):
+    if blindType == 'ssca':
+        Np = 64 # Number of strips (N*Np points to process).
+        # SCF blind estimates.
+        fN, aN, sscaN = csp.ssca(sig, Np, conj=False)
+        fC, aC, sscaC = csp.ssca(sig, Np, conj=True)
+        # Coherences of SCFs.
+        scN = csp.sscaSc(sig, sscaN, conj=False)
+        scC = csp.sscaSc(sig, sscaC, conj=True)
+        # Retrieve highest coherences.
+        quadsN = csp.scfFilter(fN, aN, scN, sscaN, threshold=thresh,
+            top=nMax, sortby=sortby)
+        quadsC = csp.scfFilter(fC, aC, scC, sscaC, threshold=thresh,
+            top=nMax, sortby=sortby)
+    else: # blindType == 'fam'.
+        L = 8 # Number of samples to slide window.
+        # SCF blind estimates.
+        fN, alphaN, famN = csp.fam(sig, L, conj=False)
+        fC, alphaC, famC = csp.fam(sig, L, conj=True)
+        # Coherences of SCFs.
+        scNF = csp.famSc(sig, fN, alphaN, famN, conj=False)
+        scCF = csp.famSc(sig, fC, alphaC, famC, conj=True)
+        # Retrieve highest coherences.
+        quadsN = csp.scfFilter(fN, alphaN, scNF, famN, threshold=thresh,
+            top=nMax, sortby='scf')
+        quadsC = csp.scfFilter(fC, alphaC, scCF, famC, threshold=thresh,
+            top=nMax, sortby='scf')
+    return quadsN, quadsC
+
+def cli(argv):
+
+    # Defaults.
+    blind = 'ssca'
+    fc_Hz = None
+    fs_Hz = None
+    outDir = ''
+    scf = 'tsm'
+    sigFile = ''
+    thresh = 0.1 # Ignore spectral coherences below this.
+    win = None
+
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == '-b': # Blind detection, default 'ssca'.
+            i += 1
+            blind = argv[i].strip().lower()
+            if blind not in ['fam', 'ssca']:
+                usage()
+        elif arg == '-c': # Hz, center frequency.
+            i += 1
+            fcStr = argv[i]
+            fc_Hz = float(argv[i])
+        elif arg == '-h': # Help message.
+            usage()
+        elif arg == '-i': # Input file.
+            i += 1
+            sigFile = argv[i]
+        elif arg == '-o': # Output file.
+            i += 1
+            outDir = argv[i]
+        elif arg == '-r': # Hz, sample rate.
+            i += 1
+            fsStr = argv[i]
+            fs_Hz = float(argv[i])
+        elif arg == '-s': # SCF type, default 'tsm'.
+            i += 1
+            scf = argv[i].strip().lower()
+            if scf not in ['fsm', 'tsm']:
+                usage()
+        elif arg == '-t': # Spectral coherence threshold.
+            i += 1
+            try:
+                thresh = float(argv[i])
+            except ValueError:
+                print('threshold -t \'%s\' must be float.' % argv[i])
+                usage()
+        elif arg == '-w': # FSM smoothing window or TSM block size.
+            i += 1
+            try:
+                win = int(argv[i])
+            except ValueError:
+                print('window -w \'%s\' must be integer.' % argv[i])
+                usage()
+        i += 1
+    if outDir == '' or sigFile == '':
+        if outDir == '':
+            print('Missing output directory name.')
+        if sigFile == '':
+            print('Missing signal file name.')
+        print('')
+        usage()
+    if isMat(sigFile) and ((not fs_Hz is None) or (not fc_Hz is None)):
+        print('fs_Hz and fc_Hz ignored for .mat files.')
+
+    # Generate command to recreate results.
+    cmd = '%s -i %s -o %s ' % (os.path.basename(argv[0]), sigFile, outDir)
+    if blind != 'ssca':
+        cmd += '-b %s ' % blind
+    if scf != 'tsm':
+        cmd += '-s %s ' % scf
+    if thresh != 0.1:
+        cmd += '-t %s ' % thresh
+    if not win is None:
+        cmd += '-w %d ' % win
+    if not fs_Hz is None:
+        cmd += '-r %s ' % fsStr
+    if not fc_Hz is None:
+        cmd += '-c %s ' % fcStr
+
+    # Create configuration dictionary as return value.
+    config = {}
+    config['blind'] = blind
+    config['cmd'] = cmd
+    config['fc_Hz'] = fc_Hz
+    config['fs_Hz'] = fs_Hz
+    config['out'] = outDir
+    config['scf'] = scf
+    config['sig'] = sigFile
+    config['thresh'] = thresh
+    config['win'] = win
+    return config
+
+def isMat(fname):
+    '''Return True/False if file is/isn't a Matlab signal file.
+    '''
+    f = open(fname, 'rb')
+    try:
+        h = f.read(10).decode()
+    except UnicodeDecodeError:
+        h = ''
+    f.close()
+    return h == 'MATLAB 5.0'
+
+def readSig(filename):
+    if isMat(filename):
+        iq, fs_Hz, fc_Hz, bw_Hz = ml.mat5Read(filename)
+    else: # Assume binary i/q.
+        iq = np.fromfile(filename, dtype=np.complex64)
+        fs_Hz = fc_Hz = bw_Hz = None
+    return fs_Hz, fc_Hz, bw_Hz, iq
+
+def report(cfg, res, iq, cpu_s):
+    # From configuration.
+    bl = cfg['blind']
+    cmdRegen = cfg['cmd']
+    do = cfg['out']
+    fi = cfg['sig']
+    sc = cfg['scf']
+    th = cfg['thresh']
+
+    try:
+        os.mkdir(do) # Create output directory.
+    except FileExistsError:
+        pass         # Ok if directory exists.
+
+    #
+    #   C r e a t e   F i l e n a m e s
+    #
+
+    # Filenames of plots.
+    blindCfile = 'blindC.png' # Scatter, blind conjugate.
+    blindNfile = 'blindN.png' # Scatter, blind non-conjugate.
+    cyclesCfile = 'cyclesC.png'
+    cyclesNfile = 'cyclesN.png'
+    scfCfile = 'scfC.png'     # Curve, SCF conjugate.
+    scfNfile = 'scfN.png'     # Curve, SCF non-conjugate.
+    sigFfile = 'sigF.png'     # Freq spectrum of signal.
+    sigTfile = 'sigT.png'     # Time vs mag of signal.
+    slicesCfile = 'slicesC.png'
+    slicesNfile = 'slicesN.png'
+
+    # Creat absolute path names.
+    blindCAbs = os.path.join(do, blindCfile) # Scatter, blind conjugate.
+    blindNAbs = os.path.join(do, blindNfile) # Scatter, blind non-conjugate.
+    cyclesCAbs = os.path.join(do, cyclesCfile)
+    cyclesNAbs = os.path.join(do, cyclesNfile)
+    scfCAbs = os.path.join(do, scfCfile)     # Curve, SCF conjugate.
+    scfNAbs = os.path.join(do, scfNfile)     # Curve, SCF non-conjugate.
+    sigFAbs = os.path.join(do, sigFfile)     # Freq spectrum plot of signal.
+    sigTAbs = os.path.join(do, sigTfile)     # Time plot of signal.
+    slicesCAbs = os.path.join(do, slicesCfile)
+    slicesNAbs = os.path.join(do, slicesNfile)
+
+    #
+    #   C r e a t e   P l o t s
+    #
+
+    alphaC = res['alphaC'] # Top conjugate cycle freqs.
+    alphaN = res['alphaN'] # Top non-conj cycle freqs.
+    bw_Hz  = res['bw_Hz']  # Signal bandwidth retrieved from signal file.
+    fc_Hz  = res['fc_Hz']  # Center frequency retrieved from signal file.
+    fs_Hz  = res['fs_Hz']  # Sample rate retrieved from signal file.
+    maxBlind = res['maxBlind']
+    maxScf = res['maxScf']
+    quadsC = res['quadsC'] # Conjugate blind results, all.
+    quadsN = res['quadsN'] # Non-conjugate blind detection, all.
+    scC    = res['scC']    # Top conjugate spectral coherences.
+    scN    = res['scN']    # Top non-conjugate spectral coherences.
+    scfC   = res['scfC']   # Top conjugate spectral correlation function.
+    scfN   = res['scfN']   # Top non-conjugate spectral correlation function.
+    win    = res['win']
+
+    # Make plots to use in report.
+    cspPlot.spectrum(iq, fc_Hz, fs_Hz, foutTime=sigTAbs, foutFreq=sigFAbs)
+    cspPlot.scatter(quadsC, fc_Hz=fc_Hz, fs_Hz=fs_Hz, fout=blindCAbs)
+    cspPlot.scatter(quadsN, fc_Hz=fc_Hz, fs_Hz=fs_Hz, fout=blindNAbs)
+    cspPlot.cycles(alphaC, scfC, fc_Hz=fc_Hz, fs_Hz=fs_Hz, fout=cyclesCAbs)
+    cspPlot.cycles(alphaN, scfN, fc_Hz=fc_Hz, fs_Hz=fs_Hz, fout=cyclesNAbs)
+    cspPlot.slices(alphaC, scC, fc_Hz, fs_Hz, fout=slicesCAbs)
+    cspPlot.slices(alphaN, scN, fc_Hz, fs_Hz, fout=slicesNAbs)
+
+    top = 5
+    sCtop = scfC[:top]
+    aCtop = alphaC[:top]
+    sNtop = scfN[:top]
+    aNtop = alphaN[:top]
+
+    keyC = []
+    keyN = []
+    for alpha in aCtop:
+        _, xPwr10, _ = util.engNot(fs_Hz)
+        xPre = util.siPrefix(xPwr10)
+        a = (fs_Hz*alpha)/10**xPwr10
+        keyC.append('$\\alpha = %.4f$ %sHz' % (a, xPre))
+    for alpha in aNtop:
+        _, xPwr10, _ = util.engNot(fs_Hz)
+        xPre = util.siPrefix(xPwr10)
+        a = (fs_Hz*alpha)/10**xPwr10
+        keyN.append('$\\alpha = %.4f$ %sHz' % (a, xPre))
+    cspPlot.scf(sCtop, key=keyC, fc_Hz=fc_Hz, fs_Hz=fs_Hz, fout=scfCAbs)
+    cspPlot.scf(sNtop, key=keyN, fc_Hz=fc_Hz, fs_Hz=fs_Hz, fout=scfNAbs)
+
+    #
+    #   C r e a t e   L a T e X   R e p o r t
+    #
+
+    cspTex = 'csp.tex'
+    cspTexAbs = os.path.join(do, cspTex)
+    r = tex.LaTeX(cspTexAbs)
+    r.beginning()
+    r.intro(fi, sigTfile, sigFfile, cmdRegen)
+    r.blindScf(blindCfile, blindNfile, bl, maxBlind, th)
+    r.cycles(cyclesCfile, cyclesNfile, alphaC, scC, alphaN, scN,
+        fc_Hz=fc_Hz, fs_Hz=fs_Hz)
+    r.slices(slicesCfile, slicesNfile, sc, th, win, maxScf)
+    r.scf(scfCfile, scfNfile, sc, th, win, top)
+    r.ending(cpu_s)
+    cmd = '(cd %s; pdflatex %s; pdflatex %s)' % (do, cspTex, cspTex)
+    cmd += ' >/dev/null 2>&1' # Suppress stdout and stderr.
+    os.system(cmd)
+
+def scf(scfType, sig, alphas, conj=False, fs_Hz=1, win=None):
+
+    if not scfType in ['fsm', 'tsm']:
+        print('scpScf: scfType must be fsm or tsm, got %s.' % scfType)
+        return None
+
+    scfs = []
+    if win is None:
+        w = 512 if scfType=='tsm' else int(0.01*sig.size)
+    else:
+        w = win
+
+    if scfType == 'fsm':
+        X = csp.cyperInit(sig)
+    for alpha in alphas:
+        if scfType == 'fsm':
+            s = csp.cyper(X, alpha, conj)
+            s = csp.smooth(s, w)
+        else: # scfType == 'tsm'
+            s = csp.scfTsm(sig, w, alpha, conj)
+        scfs.append(fs_Hz*s)
+    return np.array(scfs), w
+
+def usage():
+    print('Usage: csp -i sigFile -o outDir [-h] [-b fam|ssca] ', end='')
+    print('[-c fc] [-r fs] ')
+    print('  [-s fsm|tsm] [-t num] [-w win]')
+    print()
+    print('-b: default ssca, blind estimation method, fam or ssca.')
+    print('-c: Hz, center frequency of input signal.')
+    print('-h: help message.')
+    print('-i: matlab or binary i/q signal file name.')
+    print('-o: directory where CSP analysis results will be written.')
+    print('-r: Hz, sample rate of input signal.')
+    print('-s: default tsm, spectral correlation function, fsm or tsm.')
+    print('-t: spectral coherence threshold, default 0.1.')
+    print('-w: FSM smoothing window or TSM block, in samples.')
+    print('\nNote: -c and -r are used with .iq files and ignored with .mat.')
+    sys.exit(1)
+
+#
+#   m a i n
+#
+
+def main(argv):
+
+    config = cli(argv)     # Dictionary of settings.
+
+    t0 = time.process_time()
+    res, iq = analyze(config)
+    t1 = time.process_time()
+    cpu_s = t1 - t0
+
+    t0 = time.process_time()
+    report(config, res, iq, cpu_s) # Generate LaTeX doc.
+    t1 = time.process_time()
+    print('%8.1f ms: Writing report' % ((t1-t0)*1e3))
+
+if __name__ == '__main__':
+    main(sys.argv)
